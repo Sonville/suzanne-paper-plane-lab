@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.env
+.env.*
+*.log
+
+# Generated teaching materials and working files
+output/
+tmp/
+*.pptx
+*.inspect.ndjson
+AI紙飛機實驗室_*/
+覺察太陽對地球的重要性/
+generate_lift_infographic.py
+紙飛機升力示意圖_繁體中文.png
+suzanne-paperplane-qr.png
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
