@@ -4,137 +4,13 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { Brain, CheckCircle2, CloudRain, Crosshair, Eye, EyeOff, Gauge, Info, Plane, Rewind, RotateCcw, Scale, Sparkles, Sun, Wind } from 'lucide-react';
 import './styles.css';
+import { DEFAULT_SETTINGS, BIOMES, MODELS, clamp, simulateFlight, getCg } from './simulation.js';
+import { makePlane, updatePlane, clearance, makeLauncher, updateLauncher, makeBiome, animateBiome, disposeObject, loadModel, normalizeModel, playSound } from './lab-scene.js';
+import LabControls from './LabControls.jsx';
 
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const WORLD_X_SCALE = 1.25;
 const WORLD_Y_SCALE = 1.1;
 const WORLD_Z_SCALE = 1.35;
-
-const clipMultiplier = placement => placement === 'both' ? 2 : 1;
-const lateralSign = placement => placement === 'left' ? 1 : placement === 'right' ? -1 : 0;
-
-function simulateFlight(settings) {
-  const { clipCount, clipPosition, clipPlacement, throwAngle, throwPower, wind, windDirection, weather, goal } = settings;
-  const effectiveClipCount = clipCount * clipMultiplier(clipPlacement);
-  const sideWeight = lateralSign(clipPlacement);
-  const crosswindSign = windDirection === 'left' ? 1 : windDirection === 'right' ? -1 : 0;
-  const longitudinalWind = windDirection === 'front' ? wind : 0;
-  const crosswind = crosswindSign * Math.abs(wind);
-  const mass = 0.005 + effectiveClipCount * 0.00045;
-  const targetCg = 30;
-  const cg = effectiveClipCount === 0 ? 37 : 37 - effectiveClipCount * (45 - clipPosition) * 0.11;
-  const stability = clamp(1 - Math.abs(cg - targetCg) / 24, 0.35, 1);
-  const noseHeavy = clamp((30 - cg) / 13, -0.75, 0.75);
-  const speed0 = 5.8 + throwPower * 0.12;
-  const angle = THREE.MathUtils.degToRad(throwAngle);
-  let x = 0;
-  let y = 1.35;
-  let z = 0;
-  let vx = speed0 * Math.cos(angle);
-  let vy = speed0 * Math.sin(angle);
-  let vz = 0;
-  let t = 0;
-  let peak = y;
-  const maxBank = sideWeight * clamp(0.14 + clipCount * 0.065, 0, 0.38);
-  const points = [{ x, y, z, t, roll: 0, lift: 0, drag: 0, speed: speed0, turbulence: 0 }];
-
-  while (y > 0 && t < 12) {
-    const dt = 0.04;
-    const relativeV = Math.max(0.2, vx - longitudinalWind * 0.25);
-    const speedRatio = relativeV / speed0;
-    const massFactor = clamp(0.00545 / mass, 0.82, 1.08);
-    const lift = 8.65 * speedRatio * speedRatio * stability * massFactor;
-    const drag = 0.025 * relativeV * relativeV * (1 + (1 - stability) * 1.6);
-    const goalLift = goal === 'high' ? 1.04 : 1;
-    const gustWave = weather === 'typhoon'
-      ? Math.sin(t * 5.1 + 0.7) * 0.56 + Math.sin(t * 11.7 + 1.9) * 0.3 + Math.sin(t * 2.3) * 0.22
-      : 0;
-    const turbulence = weather === 'typhoon' ? gustWave * (0.7 + Math.abs(wind) * 0.075) : 0;
-    const roll = maxBank * (1 - Math.exp(-t * 2.4))
-      + sideWeight * Math.sin(t * 7) * 0.018
-      + crosswind * 0.012 * (1 - Math.exp(-t * 1.8))
-      + turbulence * 0.085;
-    vx += ((longitudinalWind * 0.3) - drag + turbulence * 0.12) * dt;
-    vy += (lift * goalLift - 9.81 - noseHeavy * 2.5 - vy * 0.12 + turbulence * 1.25) * dt;
-    vz += (Math.sin(roll) * lift * 1.8 + crosswind * 0.46 + turbulence * 2.2 - vz * 0.38) * dt;
-    x += Math.max(0, vx) * dt;
-    y += vy * dt;
-    z += vz * dt;
-    t += dt;
-    peak = Math.max(peak, y);
-    points.push({ x, y: Math.max(0, y), z, t, roll, lift, drag, speed: Math.max(0, vx), turbulence });
-  }
-
-  const distance = points.at(-1).x;
-  const airtime = points.at(-1).t;
-  const deviation = points.at(-1).z;
-  let verdict = '配重接近穩定區，適合進行真實試飛。';
-  if (clipCount === 0) verdict = '目前沒有配重，機頭可能抬起後失速。';
-  else if (sideWeight !== 0) verdict = `${clipPlacement === 'left' ? '左翼' : '右翼'}較重，飛機會向同側傾斜並偏移約 ${Math.abs(deviation).toFixed(1)} 公尺。`;
-  else if (cg < 23) verdict = '機頭偏重，飛機可能很快向下俯衝。';
-  else if (cg > 36) verdict = '重心偏後，飛機可能抬頭並左右搖晃。';
-  else if (crosswindSign !== 0 && Math.abs(wind) > 2) verdict = `${windDirection === 'left' ? '左側風' : '右側風'}讓落點側偏約 ${Math.abs(deviation).toFixed(1)} 公尺。`;
-  else if (weather === 'typhoon') verdict = '颱風亂流使高度與方向持續改變，落點最難預測。';
-  else if (longitudinalWind > 3) verdict = '順風很強，軌跡會變遠，但真實飛行也更難控制。';
-  else if (longitudinalWind < -3) verdict = '逆風很強，飛機前進速度下降，但可能增加滯空時間。';
-
-  const peakIndex = points.reduce((best, point, index) => point.y > points[best].y ? index : best, 0);
-  const events = [{ progress: peakIndex / Math.max(1, points.length - 1), label: '到達最高點', detail: `${peak.toFixed(1)} 公尺`, tone: 'peak' }];
-  if (weather === 'typhoon') {
-    const gustIndex = points.reduce((best, point, index) => Math.abs(point.turbulence) > Math.abs(points[best].turbulence) ? index : best, 0);
-    events.push({ progress: gustIndex / Math.max(1, points.length - 1), label: '強烈亂流', detail: '高度與姿態突然改變', tone: 'danger' });
-  }
-  if (crosswindSign !== 0 && Math.abs(wind) > 1) {
-    events.push({ progress: 0.58, label: '側風推動', detail: `飛機向${crosswindSign > 0 ? '左' : '右'}側偏移`, tone: 'wind' });
-  }
-  if (stability < 0.72) events.push({ progress: 0.38, label: '重心不穩', detail: '機身開始明顯搖擺', tone: 'warning' });
-  events.sort((a, b) => a.progress - b.progress);
-
-  return { points, distance, peak, airtime, deviation, cg, stability, verdict, events };
-}
-
-function getCg(settings) {
-  if (settings.clipCount === 0) return 37;
-  return 37 - settings.clipCount * clipMultiplier(settings.clipPlacement) * (45 - settings.clipPosition) * 0.11;
-}
-
-function makePlane() {
-  const group = new THREE.Group();
-  const paper = new THREE.MeshStandardMaterial({ color: '#f8fbf8', roughness: 0.72, side: THREE.DoubleSide });
-  const fold = new THREE.LineBasicMaterial({ color: '#92aaa1', transparent: true, opacity: 0.5 });
-  const makeWing = (side) => {
-    const shape = new THREE.Shape();
-    shape.moveTo(0, 0);
-    shape.lineTo(-4.6, side * 1.25);
-    shape.lineTo(-3.2, side * 5.2);
-    shape.lineTo(4.8, side * 0.55);
-    shape.lineTo(5.35, 0);
-    shape.closePath();
-    const geo = new THREE.ShapeGeometry(shape);
-    const mesh = new THREE.Mesh(geo, paper);
-    return mesh;
-  };
-  group.add(makeWing(1), makeWing(-1));
-
-  const keelGeo = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(-4.5, 0, 0), new THREE.Vector3(5.35, 0, 0), new THREE.Vector3(-2.2, 0, -0.55), new THREE.Vector3(-4.5, 0, 0)
-  ]);
-  const keel = new THREE.Mesh(keelGeo, new THREE.MeshStandardMaterial({ color: '#dce9e3', side: THREE.DoubleSide }));
-  keel.rotation.x = Math.PI / 2;
-  group.add(keel);
-
-  [-1, 1].forEach(side => {
-    const crease = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(-3.9, side * 1.15, 0.02), new THREE.Vector3(4.95, side * 0.45, 0.02)
-    ]);
-    group.add(new THREE.Line(crease, fold));
-  });
-  group.rotation.x = -Math.PI / 2;
-  const carrier = new THREE.Group();
-  carrier.add(group);
-  carrier.userData.paperModel = group;
-  return carrier;
-}
 
 function makeClip() {
   const curve = new THREE.CatmullRomCurve3([
@@ -148,76 +24,6 @@ function makeClip() {
     new THREE.TubeGeometry(curve, 42, 0.035, 6, false),
     new THREE.MeshStandardMaterial({ color: '#354944', metalness: 0.78, roughness: 0.25 })
   );
-}
-
-function makeTree(height = 4.5, color = '#3f8b59') {
-  const tree = new THREE.Group();
-  tree.userData.isTree = true;
-  tree.userData.swayPhase = height * 1.7;
-  const trunk = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.18, 0.28, height * 0.42, 8),
-    new THREE.MeshStandardMaterial({ color: '#806044', roughness: 1 })
-  );
-  trunk.position.y = height * 0.21;
-  const crown = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(height * 0.3, 1),
-    new THREE.MeshStandardMaterial({ color, roughness: 0.95, flatShading: true })
-  );
-  crown.scale.set(1, 1.25, 1);
-  crown.position.y = height * 0.68;
-  tree.add(trunk, crown);
-  tree.traverse(object => { if (object.isMesh) object.castShadow = true; });
-  return tree;
-}
-
-function makeCar(color = '#d94f3d') {
-  const car = new THREE.Group();
-  const bodyMaterial = new THREE.MeshStandardMaterial({ color, roughness: 0.65 });
-  const dark = new THREE.MeshStandardMaterial({ color: '#243a3a', roughness: 0.5 });
-  const body = new THREE.Mesh(new THREE.BoxGeometry(3.8, 0.75, 1.75), bodyMaterial);
-  body.position.y = 0.65;
-  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.7, 1.55), dark);
-  cabin.position.set(-0.25, 1.3, 0);
-  car.add(body, cabin);
-  [-1.25, 1.25].forEach(x => [-0.92, 0.92].forEach(z => {
-    const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.36, 0.22, 14), dark);
-    wheel.rotation.x = Math.PI / 2;
-    wheel.position.set(x, 0.36, z);
-    car.add(wheel);
-  }));
-  car.traverse(object => { if (object.isMesh) object.castShadow = true; });
-  return car;
-}
-
-function makeDistanceMarker(distance) {
-  const marker = new THREE.Group();
-  const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.035, 0.035, 1.5, 8),
-    new THREE.MeshStandardMaterial({ color: '#48665d', roughness: 0.9 })
-  );
-  pole.position.y = 0.75;
-  const canvas = document.createElement('canvas');
-  canvas.width = 256;
-  canvas.height = 112;
-  const context = canvas.getContext('2d');
-  context.fillStyle = 'rgba(248,252,249,0.96)';
-  context.roundRect(8, 8, 240, 96, 18);
-  context.fill();
-  context.strokeStyle = '#48665d';
-  context.lineWidth = 5;
-  context.stroke();
-  context.fillStyle = '#173d32';
-  context.font = '700 48px sans-serif';
-  context.textAlign = 'center';
-  context.textBaseline = 'middle';
-  context.fillText(`${distance} m`, 128, 57);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true }));
-  label.scale.set(2.4, 1.05, 1);
-  label.position.y = 1.65;
-  marker.add(pole, label);
-  return marker;
 }
 
 function makeGrassTexture(renderer) {
@@ -377,104 +183,20 @@ function updateRainStreaks(rain, weather, wind, windDirection, delta) {
   rain.geometry.attributes.position.needsUpdate = true;
 }
 
-function makeEnvironment() {
-  const environment = new THREE.Group();
-  const road = new THREE.Mesh(
-    new THREE.PlaneGeometry(90, 4.2),
-    new THREE.MeshStandardMaterial({ color: '#7d8987', roughness: 1 })
-  );
-  road.rotation.x = -Math.PI / 2;
-  road.position.set(32, 0.012, 12);
-  environment.add(road);
-  [-1.45, 1.45].forEach(z => {
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(90, 0.025, 0.09), new THREE.MeshStandardMaterial({ color: '#eef1dc' }));
-    stripe.position.set(32, 0.035, 12 + z);
-    environment.add(stripe);
-  });
-
-  const car = makeCar();
-  car.position.set(17 * WORLD_X_SCALE, 0, 12);
-  car.rotation.y = Math.PI;
-  environment.add(car);
-
-  const rearRoad = new THREE.Mesh(
-    new THREE.PlaneGeometry(90, 3.6),
-    new THREE.MeshStandardMaterial({ color: '#899391', roughness: 1 })
-  );
-  rearRoad.rotation.x = -Math.PI / 2;
-  rearRoad.position.set(32, 0.01, -17.5);
-  environment.add(rearRoad);
-  const rearCar = makeCar('#3978b8');
-  rearCar.scale.setScalar(0.78);
-  rearCar.position.set(9.5 * WORLD_X_SCALE, 0, -17.5);
-  environment.add(rearCar);
-
-  const lake = new THREE.Mesh(
-    new THREE.CircleGeometry(6.2, 48),
-    new THREE.MeshStandardMaterial({ color: '#6eb9c2', roughness: 0.35, metalness: 0.05, transparent: true, opacity: 0.9 })
-  );
-  lake.rotation.x = -Math.PI / 2;
-  lake.scale.x = 1.65;
-  lake.position.set(27 * WORLD_X_SCALE, 0.018, -12);
-  environment.add(lake);
-
-  const treeData = [
-    [4, -9, 3.8, '#3f8b59'], [8, -12, 4.8, '#347951'], [12, -8.5, 4.2, '#4b9660'],
-    [18, -11, 5.1, '#367b4f'], [23, -8.8, 4.0, '#4f9560'], [29, -12, 5.4, '#35764d'],
-    [35, -9, 4.7, '#438b58']
-  ];
-  treeData.forEach(([meters, z, height, color]) => {
-    const tree = makeTree(height, color);
-    tree.position.set(meters * WORLD_X_SCALE, 0, z);
-    environment.add(tree);
-  });
-
-  [5, 10, 15, 20, 25, 30].forEach((distance, index) => {
-    const marker = makeDistanceMarker(distance);
-    marker.position.set(distance * WORLD_X_SCALE, 0, index % 2 ? -4.3 : -3.9);
-    environment.add(marker);
-  });
-
-  const grassMaterial = new THREE.MeshStandardMaterial({ color: '#5f9d62', roughness: 1 });
-  for (let index = 0; index < 24; index += 1) {
-    const grass = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.55 + (index % 3) * 0.12, 5), grassMaterial);
-    const x = 2 + index * 2.15;
-    grass.position.set(x, 0.28, index % 2 ? 4.3 + (index % 4) : -4.5 - (index % 3));
-    environment.add(grass);
-  }
-
-  const flowerColors = ['#f3cf46', '#e96b68', '#f3f1ee'];
-  for (let index = 0; index < 12; index += 1) {
-    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.55, 6), grassMaterial);
-    stem.position.y = 0.275;
-    const bloom = new THREE.Mesh(
-      new THREE.SphereGeometry(0.13, 8, 6),
-      new THREE.MeshStandardMaterial({ color: flowerColors[index % flowerColors.length], roughness: 0.8 })
-    );
-    bloom.position.y = 0.58;
-    const flower = new THREE.Group();
-    flower.add(stem, bloom);
-    flower.position.set(3 + index * 3.1, 0, index % 2 ? 4.8 : -5.2);
-    environment.add(flower);
-  }
-
-  const startLine = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.035, 5.5), new THREE.MeshStandardMaterial({ color: '#f7faf4' }));
-  startLine.position.set(0, 0.035, 0);
-  environment.add(startLine);
-  return environment;
-}
-
-function FlightScene({ settings, flightRequest, replayResult, onResult, onFlightState, onFlightEvent, showForces, cameraMode }) {
+function FlightScene({ settings, flightRequest, replayResult, onResult, onFlightState, onFlightEvent, onTelemetry, showForces, cameraMode, focusRequest, creaseRequest, assetRequest, onAssetStatus, onCustomPlane, restoreRequest, resetRequest }) {
   const host = useRef(null);
   const sceneRef = useRef(null);
   const cameraModeRef = useRef(cameraMode);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const assetEpoch = useRef(0);
 
   useEffect(() => {
     const el = host.current;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#dfeee8');
-    scene.fog = new THREE.Fog('#dfeee8', 45, 120);
-    const camera = new THREE.PerspectiveCamera(42, el.clientWidth / el.clientHeight, 0.1, 180);
+    scene.fog = new THREE.Fog('#dfeee8', 180, 1000);
+    const camera = new THREE.PerspectiveCamera(42, el.clientWidth / el.clientHeight, 0.1, 2000);
     camera.position.set(14, 9, 17);
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(el.clientWidth < 760 ? 1 : Math.min(window.devicePixelRatio, 1.5));
@@ -483,10 +205,13 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
     el.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.addEventListener('start', () => {
+      if (sceneRef.current) { sceneRef.current.manualOrbit = true; sceneRef.current.focusActive = false; }
+    });
     controls.enableDamping = true;
     controls.enablePan = false;
     controls.minDistance = 8;
-    controls.maxDistance = 34;
+    controls.maxDistance = 500;
     controls.target.set(2, 2.5, 0);
 
     const hemisphere = new THREE.HemisphereLight('#ffffff', '#789187', 2.3);
@@ -497,11 +222,12 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
     scene.add(sun);
 
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(150, 64),
+      new THREE.PlaneGeometry(1800, 700),
       new THREE.MeshStandardMaterial({ map: makeGrassTexture(renderer), color: '#e5f0df', roughness: 1 })
     );
     ground.rotation.x = -Math.PI / 2;
     ground.position.y = -0.05;
+    ground.position.x = 450;
     ground.receiveShadow = true;
     scene.add(ground);
 
@@ -511,18 +237,21 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
     grid.material.transparent = true;
     grid.material.opacity = 0.28;
     scene.add(grid);
-    const environment = makeEnvironment();
+    const environment = makeBiome(settings.biome);
     scene.add(environment);
+    const launcher = makeLauncher(settings); scene.add(launcher);
+    const customObjects = new THREE.Group(); scene.add(customObjects);
     const trees = [];
     environment.traverse(object => { if (object.userData.isTree) trees.push(object); });
 
-    const plane = makePlane();
+    const plane = makePlane(settings);
     plane.scale.setScalar(0.3);
     plane.position.set(0, 1.35 * WORLD_Y_SCALE, 0);
     plane.traverse(obj => { if (obj.isMesh) obj.castShadow = true; });
     scene.add(plane);
 
     const clips = new THREE.Group();
+    clips.userData.clips = true;
     plane.userData.paperModel.add(clips);
 
     const pathMaterial = new THREE.LineBasicMaterial({ color: '#e24e36', transparent: true, opacity: 0 });
@@ -550,7 +279,8 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       scene, camera, renderer, controls, plane, clips, pathLine, pathMaterial,
       previousPathLine, previousPathMaterial, forceGroup, forceArrows,
       windStreaks, rainStreaks, windSpeed: 0, windDirection: 'front', weather: 'clear',
-      hemisphere, sun, ground, trees,
+      hemisphere, sun, ground, trees, environment, launcher, customObjects, customBackground: null,
+      tuning: settings, focusActive: false, assetEpoch: 0,
       cameraGoal: camera.position.clone(), targetGoal: controls.target.clone(),
       isFlying: false, raf: 0, flightRaf: 0
     };
@@ -576,9 +306,18 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       updateWindStreaks(state.windStreaks, state.windSpeed, state.windDirection, delta);
       updateRainStreaks(state.rainStreaks, state.weather, state.windSpeed, state.windDirection, delta);
       const look = weatherLooks[state.weather];
-      scene.background.lerp(look.sky, 0.035);
+      const tuning = settingsRef.current;
+      updatePlane(state.plane, tuning, delta, now);
+      updateLauncher(state.launcher, tuning, now);
+      animateBiome(state.environment, delta);
+      if (!state.isFlying && !state.hasResult) {
+        state.plane.rotation.set(0, 0, 0);
+        state.plane.userData.paperModel.rotation.x = -Math.PI / 2;
+        state.plane.position.set(0, tuning.initialAltitude * WORLD_Y_SCALE + clearance(state.plane), 0);
+      }
+      if (!state.customBackground) scene.background.lerp(new THREE.Color(BIOMES[tuning.biome].sky).lerp(look.sky, tuning.biome === 'moon' ? 0 : state.weather === 'clear' ? 0 : 0.4), 0.035);
       scene.fog.color.lerp(look.sky, 0.035);
-      state.ground.material.color.lerp(look.ground, 0.035);
+      state.ground.material.color.lerp(new THREE.Color(BIOMES[tuning.biome].ground), 0.035);
       state.ground.material.roughness = THREE.MathUtils.lerp(state.ground.material.roughness, look.roughness, 0.04);
       state.sun.intensity = THREE.MathUtils.lerp(state.sun.intensity, look.sun, 0.04);
       state.hemisphere.intensity = THREE.MathUtils.lerp(state.hemisphere.intensity, look.hemisphere, 0.04);
@@ -588,7 +327,7 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
         const sway = windLean + Math.sin(now * 0.004 + tree.userData.swayPhase + index) * swayStrength;
         tree.rotation.z = THREE.MathUtils.lerp(tree.rotation.z, sway, 0.08);
       });
-      if (sceneRef.current.cameraGoal) {
+      if (sceneRef.current.cameraGoal && !state.manualOrbit && (cameraModeRef.current !== 'overview' || state.focusActive)) {
         camera.position.lerp(sceneRef.current.cameraGoal, 0.075);
         controls.target.lerp(sceneRef.current.targetGoal, 0.075);
       }
@@ -602,6 +341,8 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       cancelAnimationFrame(sceneRef.current?.raf);
       cancelAnimationFrame(sceneRef.current?.flightRaf);
       controls.dispose();
+      assetEpoch.current += 1;
+      disposeObject(scene);
       renderer.dispose();
       el.removeChild(renderer.domElement);
     };
@@ -610,6 +351,8 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
   useEffect(() => {
     cameraModeRef.current = cameraMode;
     if (!sceneRef.current || sceneRef.current.isFlying) return;
+    sceneRef.current.focusActive = false;
+    sceneRef.current.manualOrbit = false;
     const { cameraGoal, targetGoal, controls } = sceneRef.current;
     controls.enabled = cameraMode === 'overview';
     if (cameraMode === 'side') {
@@ -630,33 +373,128 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
 
   useEffect(() => {
     if (sceneRef.current) {
-      sceneRef.current.windSpeed = settings.wind;
+      sceneRef.current.windSpeed = settings.biome === 'moon' ? 0 : settings.wind;
       sceneRef.current.windDirection = settings.windDirection;
     }
-  }, [settings.wind, settings.windDirection]);
+  }, [settings.wind, settings.windDirection, settings.biome]);
 
   useEffect(() => {
-    if (!sceneRef.current) return;
-    const state = sceneRef.current;
-    state.weather = settings.weather;
-    const looks = {
-      clear: { sky: '#dfeee8', ground: '#e5f0df', sun: 3.2, hemisphere: 2.3, roughness: 1 },
-      rain: { sky: '#a9bec2', ground: '#c6d7c0', sun: 1.45, hemisphere: 1.6, roughness: 0.72 },
-      typhoon: { sky: '#5d7076', ground: '#91a997', sun: 0.65, hemisphere: 1.05, roughness: 0.48 }
-    };
-    const look = looks[settings.weather];
-    state.scene.background.set(look.sky);
-    state.scene.fog.color.set(look.sky);
-    state.ground.material.color.set(look.ground);
-    state.ground.material.roughness = look.roughness;
-    state.sun.intensity = look.sun;
-    state.hemisphere.intensity = look.hemisphere;
-  }, [settings.weather]);
+    if (sceneRef.current) sceneRef.current.weather = settings.biome === 'moon' ? 'clear' : settings.weather;
+  }, [settings.weather, settings.biome]);
+
+  useEffect(() => {
+    const state = sceneRef.current; if (!state) return;
+    disposeObject(state.environment); state.scene.remove(state.environment);
+    state.environment = makeBiome(settings.biome); state.scene.add(state.environment);
+    state.customBackground?.dispose(); state.customBackground = null;
+    state.scene.background = new THREE.Color(BIOMES[settings.biome].sky);
+    state.scene.fog.color.set(BIOMES[settings.biome].sky);
+    state.ground.material.color.set(BIOMES[settings.biome].ground);
+  }, [settings.biome]);
+
+  useEffect(() => {
+    const state = sceneRef.current; if (!state) return;
+    disposeObject(state.launcher); state.scene.remove(state.launcher);
+    state.launcher = makeLauncher(settings); state.scene.add(state.launcher);
+    state.hasResult = false;
+  }, [settings.launcher, settings.initialAltitude]);
+
+  useEffect(() => {
+    const state = sceneRef.current; if (!state) return;
+    const oldPlane = state.plane;
+    oldPlane.userData.paperModel.remove(state.clips);
+    disposeObject(oldPlane); state.scene.remove(oldPlane);
+    state.plane = makePlane(settings); state.plane.scale.setScalar(0.3 * settings.displayScale);
+    state.plane.userData.paperModel.add(state.clips); state.scene.add(state.plane);
+    state.plane.position.y = settings.initialAltitude * WORLD_Y_SCALE + clearance(state.plane);
+    state.hasResult = false; onCustomPlane('');
+  }, [settings.model, restoreRequest]);
+
+  useEffect(() => {
+    const state = sceneRef.current; if (!state || !resetRequest) return;
+    assetEpoch.current += 1;
+    state.hasResult = false; state.focusActive = false;
+    state.manualOrbit = false;
+    state.cameraGoal.set(7, 6.5, 22); state.targetGoal.set(4, 2, 0);
+    state.pathMaterial.opacity = 0; state.previousPathMaterial.opacity = 0;
+    state.customBackground?.dispose(); state.customBackground = null;
+    state.scene.background = new THREE.Color(BIOMES[settings.biome].sky);
+    disposeObject(state.customObjects); state.customObjects.clear();
+    onAssetStatus({ message: '已重設參數與自訂素材。' });
+  }, [resetRequest]);
+
+  useEffect(() => {
+    const state = sceneRef.current; if (!state || !focusRequest.id || state.isFlying) return;
+    const key = focusRequest.target;
+    const offsets = { overview: [5, 5, 7], nose: [4, 1.5, 3], tail: [-4, 2, 3], front: [7, 0.8, 0.2], wing: [0, 2, 5], cg: [0, 6, 0.5] };
+    const center = state.plane.position;
+    state.cameraGoal.copy(center).add(new THREE.Vector3(...(offsets[key] || offsets.overview)));
+    state.targetGoal.copy(center); state.controls.enabled = true; state.focusActive = true; state.manualOrbit = false;
+  }, [focusRequest.id]);
+
+  useEffect(() => {
+    if (sceneRef.current && creaseRequest) sceneRef.current.plane.userData.creaseStarted = performance.now();
+  }, [creaseRequest]);
+
+  useEffect(() => {
+    if (!assetRequest.id || !sceneRef.current) return;
+    const state = sceneRef.current, epoch = ++assetEpoch.current;
+    const current = () => assetEpoch.current === epoch;
+    async function run() {
+      onAssetStatus({ busy: true, message: '正在解析檔案…' });
+      try {
+        if (assetRequest.kind === 'clear') {
+          disposeObject(state.customObjects); state.customObjects.clear();
+          state.customBackground?.dispose(); state.customBackground = null;
+          state.scene.background = new THREE.Color(BIOMES[settingsRef.current.biome].sky);
+          onAssetStatus({ message: '已清除自訂背景與地景。' }); return;
+        }
+        if (assetRequest.kind === 'sky') {
+          const file = assetRequest.files[0];
+          if (!/\.(jpe?g|png)$/i.test(file.name) || file.size > 10 * 1024 * 1024) throw new Error('背景需為 10 MB 以內的 JPG 或 PNG。');
+          const image = await createImageBitmap(file);
+          if (!current()) { image.close(); return; }
+          if (image.width > 4096 || image.height > 2048 || Math.abs(image.width / image.height - 2) > 0.1) { image.close(); throw new Error('請使用 2:1 全景圖，最大 4096×2048。'); }
+          const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height; canvas.getContext('2d').drawImage(image, 0, 0); image.close();
+          const texture = new THREE.CanvasTexture(canvas); texture.mapping = THREE.EquirectangularReflectionMapping; texture.colorSpace = THREE.SRGBColorSpace;
+          state.customBackground?.dispose(); state.customBackground = texture; state.scene.background = texture;
+          onAssetStatus({ message: `已載入背景：${file.name}` }); return;
+        }
+        const { files, kind } = assetRequest;
+        if (files.length > 10 || (kind === 'objects' && state.customObjects.children.length + files.length > 30)) throw new Error('一次最多 10 個，場景總數最多 30 個物件。');
+        let loaded = 0; const errors = [];
+        for (const file of files) {
+          try {
+            const model = await loadModel(file);
+            if (!current()) { disposeObject(model); return; }
+            if (kind === 'plane') {
+              // Source +Z nose maps to +X world. Convert world Y-up to the paper's local Z-up frame.
+              const wrapper = normalizeModel(model, 9.5); wrapper.rotation.y = Math.PI / 2;
+              const oriented = new THREE.Group(); oriented.rotation.x = Math.PI / 2; oriented.add(wrapper);
+              const data = state.plane.userData;
+              if (data.custom) { data.paperModel.remove(data.custom); disposeObject(data.custom); }
+              data.geometry.visible = false; data.custom = oriented; data.paperModel.add(oriented);
+              state.hasResult = false; onCustomPlane(file.name);
+            } else {
+              const wrapper = normalizeModel(model, 3);
+              const index = state.customObjects.children.length;
+              wrapper.position.set(-4 + Math.floor(index / 2) * 6, 0, (index % 2 ? -1 : 1) * (17 + Math.random() * 2));
+              wrapper.rotation.y = Math.random() * Math.PI * 2; state.customObjects.add(wrapper);
+            }
+            loaded++;
+          } catch (error) { errors.push(`${file.name}：${error.message}`); }
+        }
+        if (current()) onAssetStatus({ error: errors.length > 0, message: `成功載入 ${loaded} 個模型；地景共 ${state.customObjects.children.length} 個。${errors.join('；')}` });
+      } catch (error) { if (current()) onAssetStatus({ error: true, message: error.message }); }
+    }
+    run();
+    return () => { assetEpoch.current += 1; };
+  }, [assetRequest.id]);
 
   useEffect(() => {
     if (!sceneRef.current) return;
     const { clips } = sceneRef.current;
-    clips.clear();
+    disposeObject(clips); clips.clear();
     const x = 4.9 - (settings.clipPosition / 100) * 9.4;
     const wingOffset = clamp(0.65 + (4.9 - x) * 0.35, 0.65, 3.4);
     const sides = settings.clipPlacement === 'both'
@@ -670,7 +508,8 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       for (let i = 0; i < settings.clipCount; i += 1) {
         const clip = makeClip();
         const spread = (i - (settings.clipCount - 1) / 2) * 0.24;
-        clip.position.set(x, side === 0 ? spread : side * wingOffset + spread, 0.11 + i * 0.025);
+        clip.userData.targetZ = 0.11 + i * 0.025;
+        clip.position.set(x, side === 0 ? spread : side * wingOffset + spread, 1.4 + i * 0.025);
         clip.scale.setScalar(0.85);
         clips.add(clip);
       }
@@ -681,6 +520,10 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
     if (!sceneRef.current || flightRequest.id === 0) return;
     const isReplay = flightRequest.mode === 'replay' && Boolean(replayResult);
     const result = isReplay ? replayResult : simulateFlight(settings);
+    const flightSettings = result.settings;
+    const state = sceneRef.current;
+    state.focusActive = false; state.manualOrbit = false; state.launcher.userData.fired = performance.now();
+    state.hasResult = false;
     onFlightState(true);
     onFlightEvent(isReplay ? { label: '慢動作重播', detail: '觀察姿態與路徑變化', tone: 'replay' } : null);
     const {
@@ -695,7 +538,10 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       previousPathLine.computeLineDistances();
       previousPathMaterial.opacity = pathMaterial.opacity > 0 ? 0.58 : 0;
     }
-    const coords = result.points.map(p => new THREE.Vector3(p.x * WORLD_X_SCALE, p.y * WORLD_Y_SCALE, p.z * WORLD_Z_SCALE));
+    plane.rotation.set(0, 0, 0);
+    plane.userData.paperModel.rotation.x = -Math.PI / 2;
+    const restClearance = clearance(plane);
+    const coords = result.points.map(p => new THREE.Vector3(p.x * WORLD_X_SCALE, p.y * WORLD_Y_SCALE + restClearance, p.z * WORLD_Z_SCALE));
     const flightCurve = new THREE.CatmullRomCurve3(coords, false, 'centripetal', 0.35);
     const trailPoints = flightCurve.getPoints(Math.max(140, coords.length * 2));
     pathLine.geometry.dispose();
@@ -704,7 +550,7 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
     pathMaterial.opacity = 0.8;
     forceGroup.visible = showForces;
     sceneRef.current.isFlying = true;
-    controls.enabled = false;
+    controls.enabled = cameraModeRef.current === 'overview';
     const paperModel = plane.userData.paperModel;
     const duration = clamp(result.airtime * 1050, 1900, 4400) * (isReplay ? 1.85 : 1);
     const landingDuration = isReplay ? 820 : 520;
@@ -714,6 +560,7 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
     const midpoint = sceneDistance * 0.5;
     const startTime = performance.now();
     let eventIndex = 0;
+    let lastTelemetry = 0;
 
     const step = now => {
       const elapsed = now - startTime;
@@ -722,21 +569,27 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       const tangent = flightCurve.getTangent(Math.min(0.999, progress + 0.002));
       const sourceIndex = Math.min(result.points.length - 1, Math.floor(progress * (result.points.length - 1)));
       const p = result.points[sourceIndex];
-      if (isReplay && eventIndex < result.events.length && progress >= result.events[eventIndex].progress) {
+      if (now - lastTelemetry > 100) {
+        onTelemetry({ distance: p.x, peak: p.y, airtime: p.t, speed: p.speed }); lastTelemetry = now;
+      }
+      if (eventIndex < result.events.length && progress >= result.events[eventIndex].progress) {
         onFlightEvent(result.events[eventIndex]);
         eventIndex += 1;
       }
       plane.position.copy(point);
+      controls.enabled = cameraModeRef.current === 'overview';
+      if (controls.enabled) { const offset = point.clone().sub(controls.target); state.camera.position.add(offset); controls.target.copy(point); }
       const targetPitch = Math.atan2(tangent.y, tangent.x);
       const targetYaw = -Math.atan2(tangent.z, tangent.x);
       plane.rotation.z = THREE.MathUtils.lerp(plane.rotation.z, targetPitch, 0.14);
       plane.rotation.y = THREE.MathUtils.lerp(plane.rotation.y, targetYaw, 0.12);
       const motionFade = Math.sin(progress * Math.PI);
-      const rollStrength = clamp((1 - result.stability) * 0.075 + Math.abs(settings.wind) * 0.006, 0.004, 0.075);
+      const rollStrength = clamp((1 - result.stability) * 0.075 + Math.abs(flightSettings.wind) * 0.006, 0.004, 0.075);
       const naturalMotion = Math.sin(progress * Math.PI * 3) * rollStrength * motionFade;
-      const stormShake = settings.weather === 'typhoon' ? (p.turbulence || 0) * 0.035 * motionFade : 0;
-      const roll = (p.roll || 0) + naturalMotion + stormShake;
+      const stormShake = flightSettings.biome !== 'moon' && flightSettings.weather === 'typhoon' ? (p.turbulence || 0) * 0.035 * motionFade : 0;
+      const roll = flightSettings.biome === 'moon' ? 0 : (p.roll || 0) + naturalMotion + stormShake;
       paperModel.rotation.x = -Math.PI / 2 + roll;
+      plane.position.y = Math.max(plane.position.y, clearance(plane));
       pathLine.geometry.setDrawRange(0, Math.max(2, Math.ceil(progress * trailPoints.length)));
       forceGroup.position.copy(plane.position);
       forceArrows.lift.setLength(clamp((p.lift || 0) * 0.16, 0.35, 2.2), 0.28, 0.15);
@@ -750,6 +603,9 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
       } else if (cameraModeRef.current === 'side') {
         cameraGoal.set(midpoint + 1.5, Math.max(5.5, scenePeak + 3.5), Math.max(24, sceneDistance * 1.25));
         targetGoal.set(midpoint + 1.5, Math.max(1.5, scenePeak * 0.42), 0);
+      } else if (cameraModeRef.current === 'tower') {
+        cameraGoal.set(-8, 7 + flightSettings.initialAltitude, 12);
+        targetGoal.copy(point);
       } else {
         cameraGoal.set(midpoint + 2, Math.max(10, scenePeak + 7), Math.max(19, sceneDistance * 0.78));
         targetGoal.set(midpoint, Math.max(1.2, scenePeak * 0.35), 0);
@@ -760,9 +616,10 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
         return;
       }
 
+      if (!result.landed) { sceneRef.current.isFlying = false; state.hasResult = true; forceGroup.visible = false; if (!isReplay) onResult(result); onFlightState(false); return; }
       const landingProgress = clamp((elapsed - duration) / landingDuration, 0, 1);
       const settle = 1 - Math.pow(1 - landingProgress, 3);
-      plane.position.set(endPoint.x + settle * 0.48, THREE.MathUtils.lerp(endPoint.y, 0.12, settle), endPoint.z);
+      plane.position.set(endPoint.x + settle * 0.48, THREE.MathUtils.lerp(endPoint.y, restClearance, settle), endPoint.z);
       plane.rotation.z = THREE.MathUtils.lerp(plane.rotation.z, 0, 0.12);
       paperModel.rotation.x = THREE.MathUtils.lerp(paperModel.rotation.x, -Math.PI / 2, 0.14);
       pathLine.geometry.setDrawRange(0, trailPoints.length);
@@ -770,6 +627,7 @@ function FlightScene({ settings, flightRequest, replayResult, onResult, onFlight
         sceneRef.current.flightRaf = requestAnimationFrame(step);
       } else {
         sceneRef.current.isFlying = false;
+        state.hasResult = true;
         forceGroup.visible = false;
         controls.enabled = cameraModeRef.current === 'overview';
         if (!isReplay) onResult(result);
@@ -802,7 +660,7 @@ function Slider({ label, value, min, max, step = 1, unit, onChange }) {
 }
 
 function App() {
-  const [settings, setSettings] = useState({ goal: 'far', clipCount: 1, clipPosition: 22, clipPlacement: 'body', throwAngle: 10, throwPower: 55, wind: 0, windDirection: 'front', weather: 'clear' });
+  const [settings, setSettings] = useState({ ...DEFAULT_SETTINGS });
   const [flightRequest, setFlightRequest] = useState({ id: 0, mode: 'launch' });
   const [result, setResult] = useState(null);
   const [previousResult, setPreviousResult] = useState(null);
@@ -812,8 +670,24 @@ function App() {
   const [cameraMode, setCameraMode] = useState('side');
   const [isAnimating, setIsAnimating] = useState(false);
   const [flightEvent, setFlightEvent] = useState(null);
+  const [liveTelemetry, setLiveTelemetry] = useState(null);
+  const [tab, setTab] = useState('experiment');
+  const [focusRequest, setFocusRequest] = useState({ id: 0, target: 'overview' });
+  const [creaseRequest, setCreaseRequest] = useState(0);
+  const [assetRequest, setAssetRequest] = useState({ id: 0, kind: '', files: [] });
+  const [assetStatus, setAssetStatus] = useState({});
+  const [customPlane, setCustomPlane] = useState('');
+  const [restoreRequest, setRestoreRequest] = useState(0);
+  const [resetRequest, setResetRequest] = useState(0);
+  const [sound, setSound] = useState(false);
+  const focus = target => setFocusRequest(current => ({ id: current.id + 1, target }));
+  const importAsset = (kind, files) => setAssetRequest(current => ({ id: current.id + 1, kind, files }));
+  const restorePlane = () => setRestoreRequest(v => v + 1);
   const update = (key, value) => {
-    setSettings(current => ({ ...current, [key]: value }));
+    if (isAnimating) return;
+    setSettings(current => ({ ...current, [key]: value, ...(key === 'biome' && value === 'moon' ? { weather: 'clear', wind: 0 } : {}) }));
+    const target = { model: 'overview', initialAltitude: 'overview', displayScale: 'overview', clipPosition: 'nose', clipCount: 'nose', cgOffset: 'cg', elevon: 'tail', reflex: 'tail', dihedral: 'front', winglet: 'wing' }[key];
+    if (target) { focus(target); playSound(key.startsWith('clip') ? 'clip' : 'fold', sound); }
     setPrediction(null);
     setPredictionFeedback(null);
   };
@@ -843,11 +717,13 @@ function App() {
 
   const launch = () => {
     if (isAnimating || (result && !prediction)) return;
+    playSound('launch', sound);
     setFlightRequest(current => ({ id: current.id + 1, mode: 'launch' }));
   };
 
   const replay = () => {
     if (isAnimating || !result) return;
+    setSettings({ ...result.settings });
     setFlightRequest(current => ({ id: current.id + 1, mode: 'replay' }));
   };
 
@@ -878,7 +754,7 @@ function App() {
   };
 
   const reset = () => {
-    setSettings({ goal: 'far', clipCount: 1, clipPosition: 22, clipPlacement: 'body', throwAngle: 10, throwPower: 55, wind: 0, windDirection: 'front', weather: 'clear' });
+    setSettings({ ...DEFAULT_SETTINGS });
     setResult(null);
     setPreviousResult(null);
     setPrediction(null);
@@ -887,18 +763,22 @@ function App() {
     setIsAnimating(false);
     setFlightRequest({ id: 0, mode: 'launch' });
     setFlightEvent(null);
+    setLiveTelemetry(null);
+    setResetRequest(v => v + 1); restorePlane();
   };
 
   return (
     <main className="app-shell">
-      <FlightScene settings={settings} flightRequest={flightRequest} replayResult={result} onResult={handleResult} onFlightState={setIsAnimating} onFlightEvent={setFlightEvent} showForces={showForces} cameraMode={cameraMode} />
+      <FlightScene settings={settings} flightRequest={flightRequest} replayResult={result} onResult={handleResult} onFlightState={setIsAnimating} onFlightEvent={setFlightEvent} onTelemetry={setLiveTelemetry} showForces={showForces} cameraMode={cameraMode} focusRequest={focusRequest} creaseRequest={creaseRequest} assetRequest={assetRequest} onAssetStatus={setAssetStatus} onCustomPlane={setCustomPlane} restoreRequest={restoreRequest} resetRequest={resetRequest} />
       <header className="topbar">
-        <div className="brand"><Plane size={22} /><span>Suzanne <b>飛行實驗室</b></span></div>
-        <div className="record">世界紀錄機型 · 教學模擬</div>
+        <div className="brand"><Plane size={22} /><span>Suzanne <b>探索實驗室</b></span></div>
+        <div className="record">{BIOMES[settings.biome].label} · {MODELS[settings.model].label}</div>
+        <button className="force-toggle" onClick={() => setTab('import')}>匯入模型</button>
+        <button className="force-toggle" aria-pressed={sound} onClick={() => setSound(v => !v)}>音效{sound ? '開' : '關'}</button>
         <button className="force-toggle" aria-pressed={showForces} onClick={() => setShowForces(value => !value)}>
           {showForces ? <Eye size={17} /> : <EyeOff size={17} />}受力
         </button>
-        <button className="icon-button" onClick={reset} title="重設所有參數" aria-label="重設所有參數"><RotateCcw size={19} /></button>
+        <button className="icon-button" disabled={assetStatus.busy} onClick={reset} title="重設所有參數" aria-label="重設所有參數"><RotateCcw size={19} /></button>
       </header>
 
       {showForces && <div className="force-legend" aria-label="飛行力量圖例">
@@ -909,7 +789,8 @@ function App() {
       <div className="view-modes" aria-label="觀看模式">
         <button className={cameraMode === 'side' ? 'active' : ''} onClick={() => setCameraMode('side')}>側視</button>
         <button className={cameraMode === 'follow' ? 'active' : ''} onClick={() => setCameraMode('follow')}>跟隨</button>
-        <button className={cameraMode === 'overview' ? 'active' : ''} onClick={() => setCameraMode('overview')}>全景</button>
+        <button className={cameraMode === 'overview' ? 'active' : ''} onClick={() => setCameraMode('overview')}>自由環繞</button>
+        <button className={cameraMode === 'tower' ? 'active' : ''} onClick={() => setCameraMode('tower')}>塔台</button>
       </div>
 
       {flightEvent && <div className={`flight-event ${flightEvent.tone}`} role="status">
@@ -918,10 +799,14 @@ function App() {
 
       <aside className={`control-panel ${isAnimating ? 'is-flying' : ''}`} aria-busy={isAnimating}>
         <div className="panel-head">
-          <div><small>任務 01</small><h1>調整 Suzanne</h1></div>
+          <div><small>調整 · 預測 · 驗證</small><h1>紙飛機探索</h1></div>
           <Info size={19} />
         </div>
 
+        <nav className="lab-tabs" aria-label="實驗室功能">{[['experiment', '試飛'], ['plane', '機身'], ['launcher', '發射'], ['environment', '場景'], ['import', '匯入']].map(([key, label]) => <button key={key} aria-pressed={tab === key} onClick={() => setTab(key)}>{label}</button>)}</nav>
+        <fieldset className="lab-fieldset" disabled={isAnimating || assetStatus.busy}>
+        <LabControls tab={tab} settings={settings} update={update} focus={focus} crease={() => { setCreaseRequest(v => v + 1); focus('overview'); playSound('fold', sound); }} importAsset={importAsset} assetStatus={assetStatus} busy={assetStatus.busy} customPlane={customPlane} restorePlane={restorePlane} />
+        {tab === 'experiment' && <>
         <div className="segmented" aria-label="飛行目標">
           <button className={settings.goal === 'far' ? 'active' : ''} onClick={() => update('goal', 'far')}><Crosshair size={16} />飛更遠</button>
           <button className={settings.goal === 'high' ? 'active' : ''} onClick={() => update('goal', 'high')}><Sparkles size={16} />飛更高</button>
@@ -935,7 +820,7 @@ function App() {
             <button className={settings.clipPlacement === 'right' ? 'selected' : ''} onClick={() => update('clipPlacement', 'right')}>右翼</button>
             <button className={settings.clipPlacement === 'both' ? 'selected' : ''} onClick={() => update('clipPlacement', 'both')}>左右對稱</button>
           </div>
-          <div className="stepper-row"><span>{settings.clipPlacement === 'both' ? '每側數量' : '數量'}</span><div className="stepper"><button onClick={() => update('clipCount', clamp(settings.clipCount - 1, 0, 3))}>−</button><strong>{settings.clipCount}</strong><button onClick={() => update('clipCount', clamp(settings.clipCount + 1, 0, 3))}>＋</button></div></div>
+          <div className="stepper-row"><span>{settings.clipPlacement === 'both' ? '每側數量' : '數量'}</span><div className="stepper"><button onClick={() => update('clipCount', clamp(settings.clipCount - 1, 0, 5))}>−</button><strong>{settings.clipCount}</strong><button onClick={() => update('clipCount', clamp(settings.clipCount + 1, 0, 5))}>＋</button></div></div>
           <Slider label="位置" value={settings.clipPosition} min={5} max={75} unit="%" onChange={v => update('clipPosition', v)} />
           <div className="plane-map"><span className="nose">機頭</span><div
             className="mini-plane"
@@ -967,8 +852,9 @@ function App() {
 
         <section>
           <h2>投擲設定</h2>
-          <Slider label="仰角" value={settings.throwAngle} min={0} max={30} unit="°" onChange={v => update('throwAngle', v)} />
+          <Slider label="仰角" value={settings.throwAngle} min={-10} max={35} unit="°" onChange={v => update('throwAngle', v)} />
           <Slider label="力道" value={settings.throwPower} min={20} max={100} unit="%" onChange={v => update('throwPower', v)} />
+          <fieldset className="lab-fieldset" disabled={settings.biome === 'moon'}>
           <Slider label="風速" value={settings.wind} min={settings.windDirection === 'front' ? -10 : 0} max={10} unit=" m/s" onChange={v => update('wind', v)} />
           <div className="wind-presets" aria-label="風速快速設定">
             {settings.windDirection === 'front' ? <>
@@ -997,8 +883,10 @@ function App() {
             <button className={settings.weather === 'typhoon' ? 'selected' : ''} onClick={() => setWeatherMode('typhoon')}><Wind size={15} />颱風</button>
           </div>
           {settings.weather === 'typhoon' && <p className="typhoon-warning">颱風模式：強風 10 m/s、斜向暴雨、陣風亂流與不規則側翻。</p>}
+        </fieldset>
         </section>
-
+        </>}
+        </fieldset>
         {result && <section className="prediction-section">
           <h2><Brain size={15} />先預測，再試飛</h2>
           <div className="prediction-options">
@@ -1010,21 +898,21 @@ function App() {
         </section>}
 
         <div className="flight-actions">
-          <button className="launch" disabled={isAnimating || Boolean(result && !prediction)} onClick={launch}><Plane size={20} />{isAnimating ? '飛行中…' : result && !prediction ? '請先選擇預測' : result ? '再次試飛' : '建立基準試飛'}</button>
-          {result && <button className="replay" disabled={isAnimating} onClick={replay}><Rewind size={18} />慢動作重播</button>}
+          <button className="launch" disabled={isAnimating || assetStatus.busy || Boolean(result && !prediction)} onClick={launch}><Plane size={20} />{isAnimating ? '飛行中…' : result && !prediction ? '請先選擇預測' : result ? '再次試飛' : '建立基準試飛'}</button>
+          {result && <button className="replay" title={customPlane ? '自訂模型不保存重播快照，請恢復內建機型後試飛。' : '使用該次試飛參數重播'} disabled={isAnimating || assetStatus.busy || Boolean(customPlane)} onClick={replay}><Rewind size={18} />慢動作重播</button>}
         </div>
       </aside>
 
       <section className="telemetry" aria-live="polite">
-        <div><Gauge size={17} /><span>預估{settings.goal === 'far' ? '距離' : '高度'}</span><strong>{score === null ? '--' : score.toFixed(1)}<small> m</small></strong></div>
-        <div><Wind size={17} /><span>滯空時間</span><strong>{result ? result.airtime.toFixed(1) : '--'}<small> s</small></strong></div>
+        <div><Gauge size={17} /><span>{isAnimating ? '即時' : '預估'}{settings.goal === 'far' ? '距離' : '高度'}</span><strong>{isAnimating && liveTelemetry ? (settings.goal === 'far' ? liveTelemetry.distance : liveTelemetry.peak).toFixed(1) : score === null ? '--' : score.toFixed(1)}<small> m</small></strong></div>
+        <div><Wind size={17} /><span>模擬滯空時間</span><strong>{isAnimating && liveTelemetry ? liveTelemetry.airtime.toFixed(1) : result ? result.airtime.toFixed(1) : '--'}<small> s</small></strong></div>
         <div><Crosshair size={17} /><span>重心位置</span><strong>{cgText}</strong></div>
-        <p>{comparison
+        <p>{isAnimating && liveTelemetry ? `飛行中：高度 ${liveTelemetry.peak.toFixed(1)} m，速度 ${liveTelemetry.speed.toFixed(1)} m/s。動畫播放時間經過調整。` : comparison
           ? `和上次相比：距離 ${comparison.distance >= 0 ? '+' : ''}${comparison.distance.toFixed(1)} m，高度 ${comparison.peak >= 0 ? '+' : ''}${comparison.peak.toFixed(1)} m，側偏 ${comparison.deviation >= 0 ? '+' : ''}${comparison.deviation.toFixed(1)} m。`
           : result?.verdict ?? '先建立基準試飛，再修改一個參數並預測結果。'}</p>
       </section>
 
-      <div className="hint">全景模式可拖曳旋轉 · 雙指縮放</div>
+      <div className="hint">自由環繞可在飛行中旋轉 · 教學近似，非實測預報</div>
     </main>
   );
 }
