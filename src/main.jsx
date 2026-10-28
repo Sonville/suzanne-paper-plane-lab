@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Brain, CheckCircle2, CloudFog, CloudLightning, CloudRain, Crosshair, Eye, EyeOff, Gauge, Info, Lock, Plane, Rewind, RotateCcw, Ruler, Scale, Snowflake, Sparkles, Sun, Unlock, Wind } from 'lucide-react';
+import { Brain, BookOpen, CheckCircle2, CloudFog, CloudLightning, CloudRain, Crosshair, Eye, EyeOff, Gauge, Info, Lock, Plane, Rewind, RotateCcw, Ruler, Scale, Snowflake, Sparkles, Sun, Unlock, Wind } from 'lucide-react';
 import './styles.css';
 import { LEVELS, PROGRESS_KEY, DAILY_KEY, loadProgress, isUnlocked, rateFlight, recordFlight, starRule, makeDailyChallenge, collidesWithObstacle } from './challenges.js';
 
@@ -11,6 +11,17 @@ const WORLD_X_SCALE = 1.25;
 const WORLD_Y_SCALE = 1.1;
 const WORLD_Z_SCALE = 1.35;
 const START_HEIGHT = 1.35 * WORLD_Y_SCALE;
+const GUIDE_STORAGE_KEY = 'suzanne-flight-guide-complete-v1';
+
+function levelHint(level) {
+  const hints = [];
+  if (level.obstacle) hints.push('障礙物會直接判定失敗；觀察它在畫面中的高度與左右位置，提早調整仰角或風向避開。');
+  if (level.direction === 'left' || level.direction === 'right') hints.push(`目前是${level.direction === 'left' ? '左' : '右'}側風，留意落點側偏；可用左右翼配重調整平衡。`);
+  if (level.wind >= 6) hints.push('風速偏強，先用較平穩的仰角試飛，再小幅調整力道。');
+  if (level.weather === 'rain' || level.weather === 'thunderstorm' || level.weather === 'typhoon') hints.push('天氣擾動會讓軌跡不穩，先確認配重與左右翼平衡，再逐次微調。');
+  if (!hints.length) hints.push('先用中等仰角和力道試飛，再每次只改一個參數，比較距離變化。');
+  return hints.join(' ');
+}
 
 const weatherProfiles = {
       clear: { wind: 0, description: '天空晴朗，適合觀察基本飛行軌跡。' },
@@ -1206,6 +1217,8 @@ function App() {
   const [panelView, setPanelView] = useState('home');
   const [activeMode, setActiveMode] = useState('free');
   const [difficultyFilter, setDifficultyFilter] = useState(0);
+  const [showGuide, setShowGuide] = useState(() => { try { return localStorage.getItem(GUIDE_STORAGE_KEY) !== 'done'; } catch { return true; } });
+  const [guideStep, setGuideStep] = useState(0);
   const dailyChallenge = useMemo(() => makeDailyChallenge(), []);
   const [dailyScore, setDailyScore] = useState(() => { try { const saved = JSON.parse(localStorage.getItem(DAILY_KEY) || '{}'); return saved.date === dailyChallenge.date ? saved : { date: dailyChallenge.date, attempts: 0, best: null }; } catch { return { date: dailyChallenge.date, attempts: 0, best: null }; } });
   const [activeLevel, setActiveLevel] = useState(null);
@@ -1431,17 +1444,46 @@ function App() {
     setPanelView('flight');
   };
 
+  const finishGuide = () => {
+    setShowGuide(false);
+    try { localStorage.setItem(GUIDE_STORAGE_KEY, 'done'); } catch { /* guide still closes for this visit */ }
+  };
+
+  const guidePages = [
+    { title: '歡迎來到飛行實驗室', body: '先從「自由實驗」開始。你可以調整紙飛機、投擲方式、天氣和風向，觀察它們怎麼影響飛行。' },
+    { title: '一次調整一個條件', body: '用滑桿調整仰角、力道或配重。天氣與風向也能設定；調整太多項時，較難知道哪個改變了結果。' },
+    { title: '先預測，再試飛', body: '完成一次基準試飛後，選擇「距離增加」「高度增加」或「滯空增加」，再試一次看看預測是否正確。' },
+    { title: '看結果並繼續挑戰', body: '下方會顯示距離、高度和滯空時間。關卡固定環境並附有提示；撞上障礙物會失敗，可查看原因後重試。' }
+  ];
+
   return (
     <main className="app-shell">
       <FlightScene settings={settings} flightRequest={flightRequest} replayResult={result} onResult={handleResult} onFlightComplete={handleFlightComplete} onFlightState={setIsAnimating} onFlightEvent={setFlightEvent} showForces={showForces} cameraMode={cameraMode} cameraLocked={cameraLocked} cameraResetRequest={cameraResetRequest} />
       <header className="topbar">
         <div className="brand"><Plane size={22} /><span>Suzanne <b>飛行實驗室</b></span></div>
         <div className="record">世界紀錄機型 · 教學模擬</div>
+        <button className="guide-toggle" onClick={() => { setGuideStep(0); setShowGuide(true); }}><BookOpen size={16} /><span>新手引導</span></button>
         <button className="force-toggle" aria-pressed={showForces} onClick={() => setShowForces(value => !value)}>
           {showForces ? <Eye size={17} /> : <EyeOff size={17} />}受力
         </button>
         <button className="icon-button" disabled={isAnimating} onClick={() => activeLevel ? startLevel(activeLevel) : reset()} title="重設本次參數（保留成就）" aria-label="重設本次參數（保留成就）"><RotateCcw size={19} /></button>
       </header>
+
+      {showGuide && <div className="guide-backdrop">
+        <section className="guide-dialog" role="dialog" aria-modal="true" aria-labelledby="guide-title">
+          <div className="guide-progress"><span>新手引導</span><span>{guideStep + 1} / {guidePages.length}</span></div>
+          <h2 id="guide-title">{guidePages[guideStep].title}</h2>
+          <p>{guidePages[guideStep].body}</p>
+          <div className="guide-dots" aria-label={`第 ${guideStep + 1} 步，共 ${guidePages.length} 步`}>
+            {guidePages.map((page, index) => <i key={page.title} className={index === guideStep ? 'active' : ''} />)}
+          </div>
+          <div className="guide-actions">
+            <button className="guide-skip" onClick={finishGuide}>略過</button>
+            {guideStep > 0 && <button onClick={() => setGuideStep(value => value - 1)}>上一步</button>}
+            <button className="guide-next" onClick={() => guideStep === guidePages.length - 1 ? finishGuide() : setGuideStep(value => value + 1)}>{guideStep === guidePages.length - 1 ? '開始使用' : '下一步'}</button>
+          </div>
+        </section>
+      </div>}
 
       {showForces && <div className="force-legend" aria-label="飛行力量圖例">
         <span><i className="lift-dot" />升力</span><span><i className="weight-dot" />重力</span>
@@ -1478,6 +1520,7 @@ function App() {
             <div className="level-heading"><strong>{level.id}．{level.name}</strong><span aria-label={`最高 ${progress[level.id]?.stars ?? 0} 星`}>{'★'.repeat(progress[level.id]?.stars ?? 0)}{'☆'.repeat(3 - (progress[level.id]?.stars ?? 0))}</span></div>
             <small>{level.environment}</small><p>{level.instruction}</p>
             <ul>{level.thresholds.map((_, index) => <li key={index}>{starRule(level, index)}</li>)}</ul>
+            <details className="level-hint"><summary>查看過關提示</summary><p>{levelHint(level)}</p></details>
             <button disabled={!isUnlocked(progress, level.id)} onClick={() => startLevel(level)}>{isUnlocked(progress, level.id) ? '開始挑戰' : `🔒 通過第 ${level.id - 1} 關後解鎖`}</button>
           </article>)}
           <button className="menu-back" onClick={() => setPanelView('home')}>返回模式選擇</button>
@@ -1499,6 +1542,7 @@ function App() {
         {activeLevel && <section className="challenge-banner">
           <strong>第 {activeLevel.id} 關 · {activeLevel.name}</strong><p>{activeLevel.environment}（固定）</p><p>{activeLevel.instruction}</p>
           <ul>{activeLevel.thresholds.map((_, index) => <li key={index}>{starRule(activeLevel, index)}</li>)}</ul>
+          <details className="level-hint" open><summary>本關提示</summary><p>{levelHint(activeLevel)}</p></details>
           <small>最高 {'★'.repeat(progress[activeLevel.id]?.stars ?? 0)}{'☆'.repeat(3 - (progress[activeLevel.id]?.stars ?? 0))} · 螺旋槳停用</small>
           <button disabled={isAnimating} className="menu-back" onClick={enterFreeMode}>回到自由實驗</button>
         </section>}
@@ -1513,6 +1557,17 @@ function App() {
           <p>距離 {challengeResult.result.distance.toFixed(1)} m · 高度 {challengeResult.result.peak.toFixed(1)} m · 側偏 {Math.abs(challengeResult.result.deviation).toFixed(1)} m</p>
           {challengeResult.daily && <p>目標距離 {dailyChallenge.target} m · 今日已飛 {dailyScore.attempts} 次 · {dailyScore.best ? `最佳 ${dailyScore.best} 次` : '尚未完成'}</p>}
           {challengeResult.daily && challengeResult.success && <p>已用 {challengeResult.attempts} 次完成今日挑戰！</p>}
+          {(challengeResult.result.collision || challengeResult.stars === 0) && <div className="failure-explanation">
+            <strong>失敗原因</strong>
+            <p>{challengeResult.result.collision
+              ? '飛機碰到障礙物，模擬在碰撞位置停止。'
+              : challengeResult.daily
+                ? `飛行 ${challengeResult.result.distance.toFixed(1)} 公尺，還沒達到今日目標 ${dailyChallenge.target} 公尺。`
+                : `飛行 ${challengeResult.result.distance.toFixed(1)} 公尺，未達本關 ${activeLevel.thresholds[0]} 公尺的最低目標。`}</p>
+            <p>{challengeResult.result.collision
+              ? '看清障礙物所在的高度和左右位置，再調整仰角或側風繞開。'
+              : '檢查仰角、力道和配重；每次只調整一項，再試飛比較距離。'}</p>
+          </div>}
           {!challengeResult.daily && challengeResult.stars > 0 && <p>已取得「{activeLevel.achievement}」{challengeResult.stars === 3 ? '與本關三星成就' : ''}。{activeLevel.id < 30 ? '下一關已解鎖！' : '恭喜通過全部關卡！'}</p>}
           {!challengeResult.daily && challengeResult.stars > 0 && activeLevel.id < 30 && <button disabled={isAnimating} onClick={() => startLevel(LEVELS[activeLevel.id])}>挑戰下一關</button>}
         </section>}
@@ -1520,6 +1575,9 @@ function App() {
         <div className="panel-head">
           <div><small>{activeLevel ? `關卡 ${activeLevel.id}` : activeMode === 'daily' ? '每日挑戰' : '自由實驗'}</small><h1>調整 Suzanne</h1></div>
           <Info size={19} />
+        </div>
+        <div className="operation-steps" aria-label="操作步驟">
+          <strong>操作流程</strong><ol><li>調整機型或投擲條件</li><li>先建立基準，再預測變化</li><li>試飛後查看距離和原因</li></ol>
         </div>
 
         <div className="camera-actions" aria-label="視角控制">
